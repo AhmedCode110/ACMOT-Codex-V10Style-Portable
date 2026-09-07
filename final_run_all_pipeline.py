@@ -581,15 +581,22 @@ def main():
             **c_timing,
         }
         row["realtime_pass"] = row["processing_fps"] >= REALTIME_FPS
+        row["near_realtime_pass"] = row["processing_fps"] >= 20.0
         row["mota_better_than_baseline"] = row["MOTA"] > baseline["MOTA"]
         row["ids_better_than_baseline"] = row["IDS"] < baseline["IDS"]
+        row["idf1_better_than_baseline"] = row["IDF1"] > baseline["IDF1"]
+        row["hota_better_than_baseline"] = row["HOTA"] > baseline["HOTA"]
         row["eligible"] = (
             row["realtime_pass"]
             and row["mota_better_than_baseline"]
             and row["ids_better_than_baseline"]
+            and row["idf1_better_than_baseline"]
+            and row["hota_better_than_baseline"]
         )
         row["mota_gain_vs_baseline"] = row["MOTA"] - baseline["MOTA"]
         row["ids_reduction_vs_baseline"] = baseline["IDS"] - row["IDS"]
+        row["idf1_gain_vs_baseline"] = row["IDF1"] - baseline["IDF1"]
+        row["hota_gain_vs_baseline"] = row["HOTA"] - baseline["HOTA"]
         row["processing_fps_margin_vs_25"] = row["processing_fps"] - REALTIME_FPS
         all_rows.append(row)
 
@@ -599,15 +606,15 @@ def main():
     valid = candidates[candidates["eligible"] == True].copy()
     if not valid.empty:
         ranked = valid.sort_values(
-            ["MOTA", "IDS", "processing_fps"],
-            ascending=[False, True, False]
+            ["processing_fps", "MOTA", "IDS", "IDF1", "HOTA"],
+            ascending=[False, False, True, False, False]
         ).reset_index(drop=True)
         winner = ranked.iloc[0].to_dict()
-        status = "PASS_PUBLISHABLE_SELECTION"
+        status = "PASS_ALL_FINAL_REQUIREMENTS"
     else:
         ranked = candidates.sort_values(
-            ["realtime_pass", "MOTA", "IDS", "processing_fps"],
-            ascending=[False, False, True, False]
+            ["realtime_pass", "processing_fps", "MOTA", "IDS", "IDF1", "HOTA"],
+            ascending=[False, False, False, True, False, False]
         ).reset_index(drop=True)
         winner = None
         status = "NO_CANDIDATE_MET_ALL_CONSTRAINTS"
@@ -620,7 +627,9 @@ def main():
             "priority_1": f"processing_fps >= {REALTIME_FPS}",
             "priority_2": "MOTA > live Baseline_Default MOTA",
             "priority_3": "IDS < live Baseline_Default IDS",
-            "tie_break_after_all_pass": "higher MOTA, then lower IDS, then higher processing_fps",
+            "required_quality_checks": "IDF1 and HOTA must also exceed the live baseline",
+            "near_realtime_definition": "20 <= processing_fps < 25",
+            "tie_break_after_all_pass": "higher processing FPS, then higher MOTA, lower IDS, higher IDF1, higher HOTA",
         },
         "hardware": gpu,
         "precision": "YOLOv8n FP16",
@@ -645,6 +654,8 @@ def main():
             "decode_inclusive_fps": float(winner["decode_inclusive_fps"]),
             "mota_gain_vs_baseline": float(winner["mota_gain_vs_baseline"]),
             "ids_reduction_vs_baseline": int(winner["ids_reduction_vs_baseline"]),
+            "idf1_gain_vs_baseline": float(winner["idf1_gain_vs_baseline"]),
+            "hota_gain_vs_baseline": float(winner["hota_gain_vs_baseline"]),
             "processing_fps_margin_vs_25": float(winner["processing_fps_margin_vs_25"]),
         },
     }
@@ -659,7 +670,10 @@ def main():
         f"1. Real-time processing >= {REALTIME_FPS:.1f} FPS.",
         "2. MOTA must beat the live Baseline_Default under the same protocol.",
         "3. IDS must be lower than the live Baseline_Default.",
-        "4. Among systems passing all gates: highest MOTA, then lowest IDS, then highest processing FPS.",
+        "4. IDF1 and HOTA must also beat the live Baseline_Default.",
+        "5. Among systems passing all gates: highest processing FPS, then highest MOTA, lowest IDS, highest IDF1, highest HOTA.",
+        "",
+        "Strict real-time is >=25 processing FPS. 20-24.99 processing FPS is reported as near real-time.",
         "",
         "Timing excludes JPEG decode, Drive writes, metric computation, CSV/report generation, and TrackEval.",
         "Decode-inclusive FPS is reported separately.",
@@ -685,12 +699,14 @@ def main():
             f"- Decode-inclusive FPS: {winner['decode_inclusive_fps']:.3f}",
             f"- MOTA gain vs baseline: {winner['mota_gain_vs_baseline']:+.3f}",
             f"- IDS reduction vs baseline: {int(winner['ids_reduction_vs_baseline'])}",
+            f"- IDF1 gain vs baseline: {winner['idf1_gain_vs_baseline']:+.3f}",
+            f"- HOTA gain vs baseline: {winner['hota_gain_vs_baseline']:+.3f}",
             f"- FPS margin vs 25: {winner['processing_fps_margin_vs_25']:+.3f}",
         ]
     else:
         report_lines += [
             "## Winner",
-            "- None. No candidate simultaneously met >=25 processing FPS, higher MOTA than baseline, and lower IDS than baseline.",
+            "- None. No candidate simultaneously met >=25 processing FPS and improved MOTA, IDF1, HOTA, and IDS over baseline.",
             "- Do not claim a publishable real-time winner from this run.",
         ]
     (root / "FINAL_PRIORITY_REPORT.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
@@ -699,7 +715,7 @@ def main():
     print("FINAL REAL-TIME PRIORITY COMPARISON")
     print("=" * 80)
     cols = ["system", "processing_fps", "decode_inclusive_fps", "HOTA", "MOTA", "IDF1", "IDS"]
-    extra = ["realtime_pass", "mota_better_than_baseline", "ids_better_than_baseline", "eligible"]
+    extra = ["realtime_pass", "near_realtime_pass", "mota_better_than_baseline", "ids_better_than_baseline", "idf1_better_than_baseline", "hota_better_than_baseline", "eligible"]
     shown = [c for c in cols + extra if c in df.columns]
     print(df[shown].to_string(index=False))
     print("\nFINAL RESULT")

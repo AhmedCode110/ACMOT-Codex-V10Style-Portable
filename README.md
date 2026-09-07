@@ -30,10 +30,20 @@ Important notes:
 Main Colab notebook:
 
 - `AC_MOT_Codex_v10style_Portable.ipynb`
+- `notebooks/ACMOT_FINAL_RUN_ALL_PIPELINE.ipynb` for the final real-time-first comparison.
 
 After this folder is pushed to GitHub, open the notebook in Colab from:
 
 `https://colab.research.google.com/github/AhmedCode110/ACMOT-Codex-V10Style-Portable/blob/main/AC_MOT_Codex_v10style_Portable.ipynb`
+
+Final Run All notebook:
+
+`https://colab.research.google.com/github/AhmedCode110/ACMOT-Codex-V10Style-Portable/blob/main/notebooks/ACMOT_FINAL_RUN_ALL_PIPELINE.ipynb`
+
+It compares the live baseline and all three finalists under the same T4/FP16
+protocol. Strict real-time is at least 25 processing FPS; 20-24.99 FPS is
+labeled near real-time. A final winner is accepted only when HOTA, MOTA, IDF1,
+and IDS also improve over the live baseline.
 
 Default Colab paths:
 
