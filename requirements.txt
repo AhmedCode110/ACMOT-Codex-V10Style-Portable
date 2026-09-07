@@ -1,0 +1,11 @@
+ultralytics==8.3.200
+motmetrics
+opencv-python-headless
+pandas
+numpy
+tqdm
+scipy
+lap
+pyyaml
+git+https://github.com/JonathonLuiten/TrackEval.git
+
