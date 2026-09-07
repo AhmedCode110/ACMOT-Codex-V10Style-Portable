@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "updated_at": null,
+  "datasets": {},
+  "detections": {},
+  "trackers": {},
+  "predictions": {},
+  "evaluation": {},
+  "completed_runs": {
+    "completed_run_codex_v10_p4_fp16_20260907_134125": {
+      "artifact_type": "completed_run",
+      "cache_id": "completed_run_codex_v10_p4_fp16_20260907_134125",
+      "completion_status": "complete",
+      "dataset": "VisDrone2019-MOT-test-dev",
+      "frame_count": 6635,
+      "frozen": true,
+      "imgsz": [
+        640,
+        736,
+        832
+      ],
+      "model": "YOLOv8n",
+      "name": "codex_v10_p4_fp16_20260907_134125",
+      "precision": "FP16",
+      "project_version": "v10_p4",
+      "safe_reuse_purposes": [
+        "paper reference",
+        "final FP16 result comparison if protocol matches",
+        "reuse saved predictions and TrackEval outputs by reference"
+      ],
+      "sequence_count": 17,
+      "storage": {
+        "drive_id": null,
+        "path_hint": "/content/drive/MyDrive/VisDrone_Results/ACMOT_CODEX_V10STYLE/codex_v10_p4_fp16_20260907_134125",
+        "type": "legacy_google_drive"
+      },
+      "systems": [
+        "Baseline_Default",
+        "Baseline_TunedTracker",
+        "ACMOT_V10STYLE_SCI"
+      ],
+      "tracker": "ByteTrack",
+      "unsafe_reuse_purposes": [
+        "do not overwrite",
+        "do not rerun just to test cache system",
+        "do not use as FP32 evidence"
+      ],
+      "validation_status": "FROZEN_FINAL"
+    }
+  },
+  "legacy_artifacts": {}
+}

@@ -1,0 +1,4 @@
+{
+  "note": "Template only. Run `python cache_manager_v10_p4.py discover` in Colab after Drive mount to generate the live inventory.",
+  "artifacts": []
+}

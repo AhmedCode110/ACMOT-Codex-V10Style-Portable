@@ -2,7 +2,7 @@
 
 This is a separate Codex-owned experiment folder. It does not replace the existing AC-MOT / ChatGPT project.
 
-Current version: `v10_p3`
+Current version: `v10_p4`
 
 Purpose:
 
@@ -25,6 +25,7 @@ Important notes:
 - If frames or GT are missing, the notebook stops before the expensive run.
 - It saves every run configuration, sequence manifest, timing file, prediction files, and final tables to Google Drive.
 - v10_p3 keeps the v10/presentation logic; it adds a development cache/replay workflow, not a new production tracking idea.
+- v10_p4 adds a cache-first workflow: search existing Drive/legacy artifacts, validate compatibility, reuse scientifically valid work, and recompute only the smallest required stage.
 
 Main Colab notebook:
 
@@ -47,11 +48,32 @@ How to run on any Colab account:
 2. Runtime -> Change runtime type -> T4 GPU.
 3. Make sure the Google Drive account has the VisDrone dataset at the default path, or edit `DATASET` in Cell 1.
 4. Run cells from top to bottom.
-5. Cell 2 checks Drive, then copies the verified dataset to `/content`.
-6. Cell 4 builds or resumes the YOLO detection cache once.
-7. Cell 5 replays/tunes quickly without YOLO.
-8. Cell 6 runs the final live benchmark only for the selected candidate.
-9. If Cell 2 reports missing frames or GT, fix the dataset before running the live benchmark.
+5. Run `python cache_manager_v10_p4.py discover`.
+6. Run `python cache_manager_v10_p4.py verify`.
+7. Run `python experiment.py --mode auto --dry-run`.
+8. Run replay or live only after reviewing the cache plan.
+9. If discovery/verify reports missing frames or GT, fix the dataset before running the live benchmark.
+
+Cache-first commands:
+
+```bash
+python cache_manager_v10_p4.py discover
+python cache_manager_v10_p4.py verify
+python cache_manager_v10_p4.py list
+python cache_manager_v10_p4.py status
+python cache_manager_v10_p4.py plan --mode replay
+python experiment.py --mode auto --dry-run
+```
+
+All commands above are non-expensive. They do not launch YOLO inference.
+
+Live benchmark command:
+
+```bash
+python experiment.py --mode live --allow-expensive -- --dataset /content/visdrone_v10_p4_local/VisDrone2019-MOT-test-dev --output /content/drive/MyDrive/VisDrone_Results/ACMOT_CODEX_V10STYLE/new_run
+```
+
+Expensive GPU inference: YES.
 
 Version rule:
 

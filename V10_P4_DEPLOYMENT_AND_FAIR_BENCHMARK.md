@@ -6,6 +6,8 @@
 
 `v10_p4` is a new protocol/deployment version. It does not change the presentation-scope AC-MOT method.
 
+`codex_v10_p4_fp16_20260907_134125` is a frozen completed FP16 run. Do not overwrite it or rerun it just to test the cache system.
+
 ## Main research system
 
 - Detector: YOLOv8n
@@ -27,6 +29,24 @@ The previous v10_p3 run used YOLOv8n FP32. v17 used FP16. Comparing their FPS di
 v10_p4 standardizes the real-time deployment precision to FP16 and defines a measurement protocol that separates image decode from the actual AC-MOT processing pipeline.
 
 ## Required fair benchmark
+
+Before any expensive benchmark, run:
+
+```bash
+python cache_manager_v10_p4.py discover
+python cache_manager_v10_p4.py verify
+python experiment.py --mode live --dry-run
+```
+
+Expensive GPU inference: NO for all three commands.
+
+Only after reviewing the plan, launch live inference with:
+
+```bash
+python experiment.py --mode live --allow-expensive -- --dataset /content/visdrone_v10_p4_local/VisDrone2019-MOT-test-dev --output /content/drive/MyDrive/VisDrone_Results/ACMOT_CODEX_V10STYLE/new_run
+```
+
+Expensive GPU inference: YES.
 
 Run all three systems under the same conditions:
 
