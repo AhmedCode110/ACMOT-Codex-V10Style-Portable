@@ -118,6 +118,7 @@ from pathlib import Path
 import json, gzip, os
 
 KNOWN_CACHE_NAMES = [
+    "detection_cache_v10_p3_yolov8n_fp16_640_736_832",
     "detection_cache_v10_p3_yolov8n_fp32_640_736_832",
     "detection_cache_v1",
     "ACMOT_IDS",
@@ -125,9 +126,13 @@ KNOWN_CACHE_NAMES = [
     "IDS_replay",
     "V10_P4_FP16_FAIR",
     "codex_v10_p4_fp16_20260907_134125",
+    "fp16",
+    "half",
+    "yolov8n_fp16",
 ]
 
 COMMON_ROOTS = [
+    Path("/content/drive/MyDrive"),
     Path("/content/drive/MyDrive/VisDrone_Results/ACMOT_CODEX_V10STYLE"),
     Path("/content/drive/MyDrive/VisDrone_Results"),
     Path("/content/drive/MyDrive/AC-MOT-results"),
@@ -137,23 +142,59 @@ COMMON_ROOTS = [
 
 def candidate_paths():
     direct = [
+        Path("/content/drive/MyDrive/VisDrone_Results/ACMOT_CODEX_V10STYLE/detection_cache_v10_p3_yolov8n_fp16_640_736_832"),
+        Path("/content/drive/MyDrive/VisDrone_Results/ACMOT_CODEX_V10STYLE/V10_P4_FP16_FAIR/detection_cache_v10_p3_yolov8n_fp16_640_736_832"),
+        Path("/content/drive/MyDrive/VisDrone_Results/ACMOT_CODEX_V10STYLE/codex_v10_p4_fp16_20260907_134125/detection_cache_v10_p3_yolov8n_fp16_640_736_832"),
         Path("/content/drive/MyDrive/VisDrone_Results/ACMOT_CODEX_V10STYLE/detection_cache_v10_p3_yolov8n_fp32_640_736_832")
     ]
     for p in direct:
         if p.exists():
             yield p
+    seen = set()
     for root in COMMON_ROOTS:
         if not root.exists():
             continue
         for path in root.rglob("*"):
-            low = path.name.lower()
-            if any(name.lower() in low for name in KNOWN_CACHE_NAMES) or "detection_cache" in low:
+            if ".ipynb_checkpoints" in path.parts:
+                continue
+            low = str(path).lower()
+            looks_named = any(name.lower() in low for name in KNOWN_CACHE_NAMES) or "detection_cache" in low or "detections" in low
+            looks_structural = path.is_dir() and (any(path.glob("*.jsonl.gz")) or any(path.glob("*.complete.json")))
+            if looks_named or looks_structural:
+                key = str(path)
+                if key in seen:
+                    continue
+                seen.add(key)
                 yield path
+
+def read_json_if_exists(path):
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception:
+        pass
+    return {}
+
+def infer_precision(path, meta):
+    hay = (str(path) + " " + json.dumps(meta, sort_keys=True, default=str)).lower()
+    for key in ["precision", "detector_precision", "dtype"]:
+        val = str(meta.get(key, "")).lower()
+        if "fp16" in val or "half" in val:
+            return "FP16"
+        if "fp32" in val or "float32" in val:
+            return "FP32"
+    if "fp16" in hay or "half" in hay:
+        return "FP16"
+    if "fp32" in hay or "float32" in hay:
+        return "FP32"
+    return "UNKNOWN"
 
 def validate_detection_cache(path):
     if not path.exists() or not path.is_dir():
         return {"status": "MISSING", "path": str(path)}
-    meta = path / "cache_meta.json"
+    meta_path = path / "cache_meta.json"
+    alt_meta_path = path / "cache.json"
+    meta = read_json_if_exists(meta_path) or read_json_if_exists(alt_meta_path)
     jsonl = sorted(path.glob("*.jsonl.gz"))
     complete = sorted(path.glob("*.complete.json"))
     frames = 0
@@ -167,12 +208,12 @@ def validate_detection_cache(path):
             frames += int(json.loads(done.read_text()).get("frames", 0))
         except Exception:
             pass
-    precision = "FP16" if "fp16" in str(path).lower() else "FP32" if "fp32" in str(path).lower() else "UNKNOWN"
+    precision = infer_precision(path, meta)
     status = "VALID" if len(jsonl) == 17 and len(complete) == 17 and sample_ok else "PARTIAL"
     return {
         "status": status,
         "path": str(path),
-        "cache_meta_exists": meta.exists(),
+        "cache_meta_exists": meta_path.exists() or alt_meta_path.exists(),
         "jsonl_gz_files": len(jsonl),
         "complete_files": len(complete),
         "frame_count_from_complete": frames or None,
@@ -186,8 +227,15 @@ if not cache_reports:
     raise RuntimeError("No candidate detection caches found. No YOLO was run.")
 
 CACHE_REPORTS = cache_reports
-DETECTION_CACHE = Path(valid_reports[0]["path"] if valid_reports else cache_reports[0]["path"])
-REPLAY_CACHE_PRECISION = (valid_reports[0] if valid_reports else cache_reports[0])["precision"]
+def cache_rank(report):
+    precision_score = {"FP16": 0, "FP32": 1, "UNKNOWN": 2}.get(report["precision"], 2)
+    frame_score = 0 if report.get("frame_count_from_complete") in (6635, None) else 1
+    return (precision_score, frame_score, report["path"])
+
+valid_reports = sorted(valid_reports, key=cache_rank)
+selected_report = valid_reports[0] if valid_reports else sorted(cache_reports, key=cache_rank)[0]
+DETECTION_CACHE = Path(selected_report["path"])
+REPLAY_CACHE_PRECISION = selected_report["precision"]
 
 print("Cache candidates:")
 for r in cache_reports:
@@ -198,6 +246,7 @@ if not valid_reports:
 
 print("Selected cache:", DETECTION_CACHE)
 print("Replay cache precision:", REPLAY_CACHE_PRECISION)
+print("Selection policy: prefer complete FP16 cache, then complete FP32 cache, never run YOLO here.")
 print("Valid for development replay: YES")
 print("Valid for FP16 final evidence:", "YES" if REPLAY_CACHE_PRECISION == "FP16" else "NO")
 print("Valid for live FPS: NO")
