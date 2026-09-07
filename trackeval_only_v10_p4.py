@@ -1,11 +1,28 @@
 """Run official TrackEval only on an existing v10_p4 run folder.
 
-This script reuses already-saved predictions/TrackEval layout and does NOT rerun YOLO or ByteTrack.
+This reuses already-saved predictions/TrackEval layout and does NOT rerun YOLO or ByteTrack.
+It uses TrackEval's Python API directly to avoid the CLI SEQMAP_FILE parser turning a single path into a list.
 """
 from pathlib import Path
-import argparse, subprocess, sys, shutil
+import argparse
+import shutil
+import subprocess
+import sys
 
 SYSTEMS = ["Baseline_Default", "Baseline_TunedTracker", "ACMOT_V10STYLE_SCI"]
+
+
+def ensure_trackeval(root: Path):
+    if not (root / "trackeval" / "__init__.py").exists():
+        if root.exists():
+            shutil.rmtree(root)
+        subprocess.run([
+            "git", "clone", "--depth", "1",
+            "https://github.com/JonathonLuiten/TrackEval.git",
+            str(root),
+        ], check=True)
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
 
 
 def main():
@@ -23,42 +40,59 @@ def main():
         if not path.exists():
             raise RuntimeError(f"Missing required cached TrackEval input: {path}")
 
-    # TrackEval's CLI scripts live in the repository's top-level scripts/ directory,
-    # not in the installed Python package namespace.
-    if not (a.trackeval_root / "scripts" / "run_mot_challenge.py").exists():
-        if a.trackeval_root.exists():
-            shutil.rmtree(a.trackeval_root)
-        subprocess.run([
-            "git", "clone", "--depth", "1",
-            "https://github.com/JonathonLuiten/TrackEval.git",
-            str(a.trackeval_root),
-        ], check=True)
+    ensure_trackeval(a.trackeval_root)
+    import trackeval
 
-    script = a.trackeval_root / "scripts" / "run_mot_challenge.py"
-    cmd = [
-        sys.executable, str(script),
-        "--GT_FOLDER", str(gt_parent),
-        "--TRACKERS_FOLDER", str(tracker_parent),
-        "--BENCHMARK", "VisDroneACMOT",
-        "--SPLIT_TO_EVAL", "test",
-        "--SEQMAP_FILE", str(seqmap),
-        "--TRACKERS_TO_EVAL", *SYSTEMS,
-        "--METRICS", "HOTA", "CLEAR", "Identity",
-        "--DO_PREPROC", "False",
-        "--USE_PARALLEL", "False",
-        "--PLOT_CURVES", "False",
+    eval_config = trackeval.Evaluator.get_default_eval_config()
+    eval_config.update({
+        "USE_PARALLEL": False,
+        "PRINT_RESULTS": True,
+        "PRINT_ONLY_COMBINED": False,
+        "PRINT_CONFIG": True,
+        "OUTPUT_SUMMARY": True,
+        "OUTPUT_DETAILED": True,
+        "PLOT_CURVES": False,
+    })
+
+    dataset_config = trackeval.datasets.MotChallenge2DBox.get_default_dataset_config()
+    dataset_config.update({
+        "GT_FOLDER": str(gt_parent),
+        "TRACKERS_FOLDER": str(tracker_parent),
+        "TRACKERS_TO_EVAL": SYSTEMS,
+        "BENCHMARK": "VisDroneACMOT",
+        "SPLIT_TO_EVAL": "test",
+        "SEQMAP_FILE": str(seqmap),
+        "DO_PREPROC": False,
+        "TRACKER_SUB_FOLDER": "data",
+        "OUTPUT_SUB_FOLDER": "",
+        "PRINT_CONFIG": True,
+    })
+
+    metrics_config = {"METRICS": ["HOTA", "CLEAR", "Identity"], "THRESHOLD": 0.5}
+
+    print("Running TrackEval only via Python API. No YOLO/ByteTrack inference will run.")
+    print("Run dir:", run)
+    print("Seqmap:", seqmap)
+
+    evaluator = trackeval.Evaluator(eval_config)
+    dataset_list = [trackeval.datasets.MotChallenge2DBox(dataset_config)]
+    metrics_list = [
+        trackeval.metrics.HOTA(metrics_config),
+        trackeval.metrics.CLEAR(metrics_config),
+        trackeval.metrics.Identity(metrics_config),
     ]
-    print("Running TrackEval only. No YOLO/ByteTrack inference will run.")
-    print(" ".join(cmd))
-    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    log = run / "trackeval_only_stdout_stderr.txt"
-    log.write_text(proc.stdout or "", encoding="utf-8")
-    print(proc.stdout)
-    if proc.returncode != 0:
-        raise RuntimeError(f"TrackEval-only run failed. See {log}")
+
+    results = evaluator.evaluate(dataset_list, metrics_list)
+
+    marker = run / "TRACKEVAL_ONLY_COMPLETE.txt"
+    marker.write_text(
+        "Official TrackEval completed from cached v10_p4 predictions. No YOLO/ByteTrack rerun.\n",
+        encoding="utf-8",
+    )
     print("TRACK EVAL ONLY COMPLETE")
     print("Results saved under:", tracker_parent)
-    print("Log:", log)
+    print("Marker:", marker)
+    return results
 
 
 if __name__ == "__main__":
