@@ -73,3 +73,55 @@ If v10_p2 result is not good:
   - tune 640/736/832 switching thresholds,
   - keep ReID and heavy controller features as ablation-only unless they clearly prove improvement.
 
+## v10_p3
+
+Status: current version.
+
+Problem addressed:
+
+- Full live YOLO runs are too slow to repeat for every small tuning change.
+- The project needs a way to try SCI/ByteTrack/resolution settings quickly without spending the whole T4 quota each time.
+
+What changed:
+
+- Added a reusable YOLO detection cache:
+  - one cache file per sequence,
+  - detections saved for `640`, `736`, and `832`,
+  - YOLOv8n FP32,
+  - low detection threshold for replay filtering.
+- Added fast replay/tuning:
+  - reuses cached detections,
+  - reruns ByteTrack and SCI logic only,
+  - saves replay predictions and summary tables.
+- Added an IDS-guarded v10-style trial:
+  - still same presentation logic,
+  - slightly more conservative thresholds,
+  - intended to reduce false new tracks / ID switches.
+
+What did not change:
+
+- Final publishable result still needs one real live run.
+- Cache/replay FPS is not a deployment FPS.
+- ReID and heavy v12 controller features remain outside the production claim.
+
+What we are testing now:
+
+- Use replay to choose between:
+  - original `ACMOT_V10STYLE_SCI`,
+  - conservative `ACMOT_V10STYLE_SCI_IDS_GUARD`.
+- Then run Cell 6 once for the selected final candidate.
+
+If v10_p3 is good:
+
+- Use final live Cell 6 metrics plus Cell 7 TrackEval outputs.
+- Keep replay outputs as development evidence only.
+
+If v10_p3 is not good:
+
+- Create `v10_p4`.
+- Stay inside v10 scope and tune:
+  - SCI thresholds,
+  - confidence floor/slope,
+  - ByteTrack `new_track_thresh`,
+  - ByteTrack `match_thresh`,
+  - resolution switching thresholds.
