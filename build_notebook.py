@@ -22,13 +22,16 @@ def cell(source, cell_type="code"):
 
 cells = []
 
-cells.append(cell("""# AC-MOT Codex v10-style Portable
+cells.append(cell("""# AC-MOT Codex v10-style Portable — v10_p2
 
 This notebook returns to the clean v10 / presentation story:
 
 1. Baseline default YOLOv8n + ByteTrack
 2. Tuned ByteTrack only
 3. AC-MOT v10-style = tuned ByteTrack + SCI adaptive threshold + SCI adaptive resolution
+
+v10_p2 keeps the v10/presentation logic, but stages the dataset from Google Drive to `/content`
+before timing. This makes the FPS measurement fairer without changing the tracking logic.
 
 It is designed for Google Colab T4 and saves reproducible outputs to Google Drive.
 
@@ -66,30 +69,38 @@ except Exception:
 from google.colab import drive
 drive.mount("/content/drive", force_remount=False)
 
+EXPERIMENT_VERSION = "v10_p2"
+
 WORK = Path("/content/acmot_codex_v10style")
 DATASET = Path("/content/drive/MyDrive/visdrone/VisDrone_Zips/VisDrone2019-MOT-test-dev/VisDrone2019-MOT-test-dev")
 OUTPUT_ROOT = Path("/content/drive/MyDrive/VisDrone_Results/ACMOT_CODEX_V10STYLE")
 WEIGHTS = Path("/content/yolov8n.pt")
+LOCAL_DATASET = WORK / "dataset_local" / "VisDrone2019-MOT-test-dev"
 
 WORK.mkdir(parents=True, exist_ok=True)
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-RUN_TAG = "codex_v10style_live17_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_TAG = f"codex_{EXPERIMENT_VERSION}_live17_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 RUN_DIR = OUTPUT_ROOT / RUN_TAG
 RUN_DIR.mkdir(parents=True, exist_ok=False)
 
 print("WORK =", WORK)
+print("VERSION =", EXPERIMENT_VERSION)
 print("DATASET =", DATASET)
+print("LOCAL_DATASET =", LOCAL_DATASET)
 print("OUTPUT_ROOT =", OUTPUT_ROOT)
 print("RUN_DIR =", RUN_DIR)
 """))
 
-cells.append(cell(r"""# CELL 2 — STRICT DATASET PREFLIGHT
+cells.append(cell(r"""# CELL 2 — STRICT DATASET PREFLIGHT + LOCAL STAGING
 import pandas as pd
 import numpy as np
+from tqdm.auto import tqdm
 
 SEQ_DIR = DATASET / "sequences"
 ANN_DIR = DATASET / "annotations"
+LOCAL_SEQ_DIR = LOCAL_DATASET / "sequences"
+LOCAL_ANN_DIR = LOCAL_DATASET / "annotations"
 
 def sha256_file(path):
     h = hashlib.sha256()
@@ -180,6 +191,39 @@ print("17/17 GT annotation files found")
 print("No duplicate sequence names")
 print("No missing GT")
 print("Frame folders are contiguous and compatible with GT max frame")
+
+print("\\nStaging dataset to local /content for fair real-time FPS...")
+stage_start = time.perf_counter()
+if LOCAL_DATASET.exists():
+    shutil.rmtree(LOCAL_DATASET)
+LOCAL_SEQ_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_ANN_DIR.mkdir(parents=True, exist_ok=True)
+
+stage_total = sum(int(r["frames_found"]) for r in rows) + len(seqs)
+pbar = tqdm(total=stage_total, desc="Stage Drive -> /content", dynamic_ncols=True)
+for s in seqs:
+    src_seq = SEQ_DIR / s
+    dst_seq = LOCAL_SEQ_DIR / s
+    dst_seq.mkdir(parents=True, exist_ok=True)
+    for fp in sorted(src_seq.glob("*.jpg"), key=image_number):
+        shutil.copy2(fp, dst_seq / fp.name)
+        pbar.update(1)
+    shutil.copy2(ANN_DIR / f"{s}.txt", LOCAL_ANN_DIR / f"{s}.txt")
+    pbar.update(1)
+pbar.close()
+stage_seconds = time.perf_counter() - stage_start
+
+local_seqs, local_anns, local_missing_ann, local_dupes, local_rows, local_missing_frames = inspect_dataset(LOCAL_DATASET)
+local_manifest_df = pd.DataFrame(local_rows)
+local_manifest_path = RUN_DIR / "dataset_local_staged_manifest.csv"
+local_manifest_df.to_csv(local_manifest_path, index=False)
+
+if local_seqs != seqs or local_missing_ann or local_dupes or local_missing_frames:
+    raise RuntimeError("Local staged dataset failed verification. Stop before benchmark.")
+
+print(f"Local staging complete in {stage_seconds/60:.2f} min")
+print("Local benchmark dataset:", LOCAL_DATASET)
+print("Saved local manifest:", local_manifest_path)
 """))
 
 cells.append(cell(r"""# CELL 3 — AC-MOT V10-STYLE CORE
@@ -364,8 +408,8 @@ def run_one_system(system):
     pbar = tqdm(total=total_frames, desc=system["name"], dynamic_ncols=True)
     sys_wall_start = time.perf_counter()
     for seq_name in seqs:
-        frames = sorted((SEQ_DIR / seq_name).glob("*.jpg"), key=image_number)
-        gt = load_gt(ANN_DIR / f"{seq_name}.txt")
+        frames = sorted((LOCAL_SEQ_DIR / seq_name).glob("*.jpg"), key=image_number)
+        gt = load_gt(LOCAL_ANN_DIR / f"{seq_name}.txt")
         reset_yolo_tracker(model)
         analyzer.reset()
         state = SceneState()
@@ -433,6 +477,7 @@ def run_one_system(system):
             "frames": len(frames),
             "fps": fps,
             "mean_latency_ms": 1000.0 / max(fps, 1e-9),
+            "timing_source": "LOCAL_/content_dataset",
             "mean_imgsz": float(np.mean(imgsz_log)),
             "mean_conf": float(np.mean(conf_log)),
             "dominant_scene": Counter(scene_log).most_common(1)[0][0] if scene_log else "unknown",
@@ -479,6 +524,7 @@ summary["ids_delta_vs_default"] = summary["ids"] - int(base["ids"])
 summary.to_csv(RUN_DIR / "live_summary_motmetrics.csv", index=False)
 
 print("\\nLIVE MOTMETRICS SUMMARY — HOTA here is approximate only until CELL 5 TrackEval")
+print("FPS is measured from LOCAL /content dataset, not slow Google Drive streaming.")
 display(summary)
 print("Saved:", RUN_DIR)
 """))
@@ -496,7 +542,7 @@ def make_trackeval_layout():
     for seq_name in seqs:
         seq_folder = gt_root / seq_name / "gt"
         seq_folder.mkdir(parents=True, exist_ok=True)
-        gt = pd.read_csv(ANN_DIR / f"{seq_name}.txt", header=None)
+        gt = pd.read_csv(LOCAL_ANN_DIR / f"{seq_name}.txt", header=None)
         gt = gt[gt.iloc[:, 7].isin(VISDRONE_GT_CLASSES)]
         gt = gt[(gt.iloc[:, 6] == 1) & (gt.iloc[:, 8] < 2) & (gt.iloc[:, 9] < 2)]
         # MOTChallenge gt: frame,id,x,y,w,h,mark,class,visibility
@@ -558,7 +604,9 @@ print("Official TrackEval finished. Use TrackEval output files under:", trackers
 cells.append(cell(r"""# CELL 6 — REPRODUCIBILITY PACK
 config = {
     "run_tag": RUN_TAG,
+    "experiment_version": EXPERIMENT_VERSION,
     "dataset": str(DATASET),
+    "local_dataset_used_for_timing": str(LOCAL_DATASET),
     "output_root": str(OUTPUT_ROOT),
     "run_dir": str(RUN_DIR),
     "work": str(WORK),
@@ -568,7 +616,8 @@ config = {
     "protocol": {
         "detector": "YOLOv8n FP32",
         "tracker": "ByteTrack",
-        "timing": "end-to-end live frame read + scene analysis + YOLO + ByteTrack with CUDA sync",
+        "timing": "end-to-end live local frame read + scene analysis + YOLO + ByteTrack with CUDA sync",
+        "drive_io": "excluded from FPS by staging dataset to /content before benchmark; staging time is separate",
         "cache": "not used for live timing",
         "hota": "quote only from official TrackEval cell output",
         "dataset_requirement": "17/17 sequences, 17/17 GT, contiguous frames matching GT",
