@@ -22,7 +22,7 @@ def cell(source, cell_type="code"):
 
 cells = []
 
-cells.append(cell("""# AC-MOT Codex v10-style Portable — v10_p2
+cells.append(cell("""# AC-MOT Codex v10-style Portable — v10_p3
 
 This notebook returns to the clean v10 / presentation story:
 
@@ -30,8 +30,15 @@ This notebook returns to the clean v10 / presentation story:
 2. Tuned ByteTrack only
 3. AC-MOT v10-style = tuned ByteTrack + SCI adaptive threshold + SCI adaptive resolution
 
-v10_p2 keeps the v10/presentation logic, but stages the dataset from Google Drive to `/content`
-before timing. This makes the FPS measurement fairer without changing the tracking logic.
+v10_p3 keeps the v10/presentation logic, stages the dataset from Google Drive to `/content`,
+and adds YOLO-once detection cache + fast replay so we can tune without repeating long YOLO runs.
+
+Workflow:
+
+1. Preflight + local staging
+2. Cache YOLO detections once at 640/736/832
+3. Replay/tune ByteTrack + SCI rules quickly
+4. Run one final live benchmark for the selected candidate
 
 It is designed for Google Colab T4 and saves reproducible outputs to Google Drive.
 
@@ -41,7 +48,8 @@ It does **not** silently skip missing dataset files.
 cells.append(cell(r"""# CELL 1 — INSTALL, MOUNT DRIVE, PATHS
 from pathlib import Path
 from datetime import datetime
-import json, os, sys, subprocess, time, shutil, hashlib, textwrap, math, gc
+import json, os, sys, subprocess, time, shutil, hashlib, textwrap, math, gc, gzip
+import importlib.metadata as metadata
 
 def pip_install(pkgs):
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", *pkgs], check=True)
@@ -69,13 +77,14 @@ except Exception:
 from google.colab import drive
 drive.mount("/content/drive", force_remount=False)
 
-EXPERIMENT_VERSION = "v10_p2"
+EXPERIMENT_VERSION = "v10_p3"
 
 WORK = Path("/content/acmot_codex_v10style")
 DATASET = Path("/content/drive/MyDrive/visdrone/VisDrone_Zips/VisDrone2019-MOT-test-dev/VisDrone2019-MOT-test-dev")
 OUTPUT_ROOT = Path("/content/drive/MyDrive/VisDrone_Results/ACMOT_CODEX_V10STYLE")
 WEIGHTS = Path("/content/yolov8n.pt")
 LOCAL_DATASET = WORK / "dataset_local" / "VisDrone2019-MOT-test-dev"
+CACHE_DIR = OUTPUT_ROOT / "detection_cache_v10_p3_yolov8n_fp32_640_736_832"
 
 WORK.mkdir(parents=True, exist_ok=True)
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -88,6 +97,7 @@ print("WORK =", WORK)
 print("VERSION =", EXPERIMENT_VERSION)
 print("DATASET =", DATASET)
 print("LOCAL_DATASET =", LOCAL_DATASET)
+print("CACHE_DIR =", CACHE_DIR)
 print("OUTPUT_ROOT =", OUTPUT_ROOT)
 print("RUN_DIR =", RUN_DIR)
 """))
@@ -388,7 +398,389 @@ for s in SYSTEMS:
 print("Tuned tracker:", TRACKER_TUNED)
 """))
 
-cells.append(cell(r"""# CELL 4 — REAL LIVE FULL-17 RUN
+cells.append(cell(r"""# CELL 4 — YOLO DETECTION CACHE ONCE
+# This is the expensive development step, but it is reusable.
+# It runs YOLOv8n FP32 on each frame at 640/736/832 and stores raw detections.
+# After this, Cell 5 can tune tracker/SCI rules without rerunning YOLO.
+
+require_t4()
+if not WEIGHTS.exists():
+    print("Downloading YOLO weights once:", WEIGHTS)
+    _download_model = YOLO(str(WEIGHTS))
+    del _download_model
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def cache_meta():
+    return {
+        "experiment_version": EXPERIMENT_VERSION,
+        "dataset": str(DATASET),
+        "local_dataset": str(LOCAL_DATASET),
+        "weights": str(WEIGHTS),
+        "weights_sha256": sha256_file(WEIGHTS) if WEIGHTS.exists() else None,
+        "ultralytics": metadata.version("ultralytics"),
+        "torch": torch.__version__,
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "sizes": [640, 736, 832],
+        "conf": 0.01,
+        "iou": 0.45,
+        "classes": COCO_CLASSES,
+        "note": "Detection cache is for development replay/tuning only. Final publishable timing still needs live run.",
+    }
+
+meta_path = CACHE_DIR / "cache_meta.json"
+new_meta = cache_meta()
+if meta_path.exists():
+    old_meta = json.loads(meta_path.read_text())
+    comparable_old = {k: old_meta.get(k) for k in new_meta}
+    if comparable_old != new_meta:
+        raise RuntimeError("Existing cache metadata differs. Do not mix cache from a different setup.")
+else:
+    meta_path.write_text(json.dumps(new_meta, indent=2), encoding="utf-8")
+
+model = YOLO(str(WEIGHTS))
+if hasattr(model, "model") and hasattr(model.model, "float"):
+    model.model.float()
+
+def detect_raw(img, size):
+    cuda_sync()
+    start = time.perf_counter()
+    r = model.predict(
+        img,
+        conf=0.01,
+        iou=0.45,
+        imgsz=size,
+        classes=COCO_CLASSES,
+        max_det=1000,
+        half=False,
+        device=0,
+        verbose=False,
+    )[0]
+    cuda_sync()
+    det = r.boxes.data.cpu().numpy().astype(float).tolist() if r.boxes is not None else []
+    return det, time.perf_counter() - start
+
+total_frames = int(local_manifest_df["frames_found"].sum())
+pbar = tqdm(total=total_frames, desc="YOLO cache 640/736/832", dynamic_ncols=True)
+cache_start = time.perf_counter()
+for seq_name in seqs:
+    frames = sorted((LOCAL_SEQ_DIR / seq_name).glob("*.jpg"), key=image_number)
+    out_file = CACHE_DIR / f"{seq_name}.jsonl.gz"
+    done_file = CACHE_DIR / f"{seq_name}.complete.json"
+    if out_file.exists() and done_file.exists():
+        receipt = json.loads(done_file.read_text())
+        if receipt.get("frames") == len(frames) and receipt.get("sha256") == sha256_file(out_file):
+            pbar.update(len(frames))
+            continue
+    partial = out_file.with_suffix(".partial")
+    with gzip.open(partial, "wt", encoding="utf-8") as f:
+        for idx, fp in enumerate(frames, start=1):
+            img = cv2.imread(str(fp))
+            if img is None:
+                raise RuntimeError(f"Unreadable image: {fp}")
+            bank, det_seconds = {}, {}
+            for size in [640, 736, 832]:
+                bank[str(size)], det_seconds[str(size)] = detect_raw(img, size)
+            small = cv2.resize(img, (0, 0), fx=0.25, fy=0.25)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            f.write(json.dumps({
+                "frame": idx,
+                "file": fp.name,
+                "shape": list(img.shape[:2]),
+                "visual": {
+                    "brightness": float(gray.mean()),
+                    "blur": float(cv2.Laplacian(gray, cv2.CV_64F).var()),
+                    "edge_density": float(cv2.Canny(gray, 50, 120).mean() / 255.0),
+                },
+                "bank": bank,
+                "det_seconds": det_seconds,
+            }) + "\n")
+            pbar.update(1)
+            if idx == 1 or idx == len(frames) or idx % 50 == 0:
+                elapsed = time.perf_counter() - cache_start
+                fps = pbar.n / max(elapsed, 1e-9)
+                eta = (elapsed / max(pbar.n, 1)) * (total_frames - pbar.n)
+                pbar.set_postfix(seq=seq_name[-12:], frame=f"{idx}/{len(frames)}", fps=f"{fps:.2f}", ETA_min=f"{eta/60:.1f}")
+    partial.replace(out_file)
+    done_file.write_text(json.dumps({
+        "sequence": seq_name,
+        "frames": len(frames),
+        "sha256": sha256_file(out_file),
+        "completed_at": datetime.now().isoformat(),
+    }, indent=2), encoding="utf-8")
+pbar.close()
+del model
+torch.cuda.empty_cache()
+print("Cache ready:", CACHE_DIR)
+print("Cache metadata:", meta_path)
+"""))
+
+cells.append(cell(r"""# CELL 5 — FAST REPLAY / TUNING WITHOUT YOLO
+# This cell reuses cached detections and runs ByteTrack + SCI logic quickly.
+# You can edit REPLAY_TRIALS and rerun this cell many times without rerunning YOLO.
+
+from ultralytics.trackers.byte_tracker import BYTETracker
+from ultralytics.engine.results import Boxes
+
+REPLAY_RUN_DIR = RUN_DIR / "replay_tuning"
+REPLAY_RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+def tracker_params(default=False):
+    if default:
+        return {"high": 0.25, "low": 0.10, "new": 0.25, "buffer": 30, "match": 0.80, "fuse": True}
+    return {"high": 0.18, "low": 0.04, "new": 0.20, "buffer": 45, "match": 0.86, "fuse": True}
+
+REPLAY_TRIALS = [
+    {
+        "name": "Baseline_Default",
+        "kind": "fixed",
+        "size": 640,
+        "conf": 0.25,
+        "iou": 0.45,
+        "tracker": tracker_params(default=True),
+        "notes": "Official-ish Ultralytics ByteTrack default baseline.",
+    },
+    {
+        "name": "Baseline_TunedTracker",
+        "kind": "fixed",
+        "size": 640,
+        "conf": 0.25,
+        "iou": 0.45,
+        "tracker": tracker_params(default=False),
+        "notes": "Tuned ByteTrack only; no SCI.",
+    },
+    {
+        "name": "ACMOT_V10STYLE_SCI",
+        "kind": "adaptive",
+        "tracker": tracker_params(default=False),
+        "conf_base": 0.245,
+        "conf_slope": 0.050,
+        "conf_floor": 0.19,
+        "conf_ceil": 0.28,
+        "scene_conf_nudge": 0.012,
+        "iou_base": 0.490,
+        "iou_slope": 0.050,
+        "sci_mid": 0.35,
+        "sci_high": 0.60,
+        "notes": "Original v10-style production candidate.",
+    },
+    {
+        "name": "ACMOT_V10STYLE_SCI_IDS_GUARD",
+        "kind": "adaptive",
+        "tracker": tracker_params(default=False) | {"new": 0.22, "match": 0.88},
+        "conf_base": 0.248,
+        "conf_slope": 0.045,
+        "conf_floor": 0.20,
+        "conf_ceil": 0.28,
+        "scene_conf_nudge": 0.008,
+        "iou_base": 0.490,
+        "iou_slope": 0.045,
+        "sci_mid": 0.40,
+        "sci_high": 0.65,
+        "notes": "Still v10 logic; slightly more conservative to reduce false new tracks/IDS.",
+    },
+]
+
+def make_replay_tracker(tp):
+    return BYTETracker(SimpleNamespace(
+        track_high_thresh=float(tp["high"]),
+        track_low_thresh=float(tp["low"]),
+        new_track_thresh=float(tp["new"]),
+        track_buffer=int(tp["buffer"]),
+        match_thresh=float(tp["match"]),
+        fuse_score=bool(tp.get("fuse", True)),
+    ), frame_rate=30)
+
+def replay_params(trial, state):
+    if trial["kind"] == "fixed":
+        return {"imgsz": int(trial["size"]), "conf": float(trial["conf"]), "iou": float(trial["iou"])}
+    conf = trial["conf_base"] - trial["conf_slope"] * state.sci
+    iou = trial["iou_base"] - trial["iou_slope"] * state.sci
+    if state.scene in ["crowded", "tiny", "night"]:
+        conf -= trial["scene_conf_nudge"]
+    imgsz = 832 if state.sci > trial["sci_high"] or state.tiny_ratio > 0.50 else 736 if state.sci > trial["sci_mid"] or state.scene in ["crowded", "tiny"] else 640
+    return {
+        "imgsz": int(imgsz),
+        "conf": float(np.clip(conf, trial["conf_floor"], trial["conf_ceil"])),
+        "iou": float(np.clip(iou, 0.40, 0.52)),
+    }
+
+def analyze_cached_visual(analyzer, visual, prev_boxes):
+    brightness = float(visual.get("brightness", 128.0))
+    blur = float(visual.get("blur", 500.0))
+    edge_density = float(visual.get("edge_density", 0.0))
+    n = len(prev_boxes)
+    crowd = min(n / 30.0, 1.0)
+    if n:
+        areas = (prev_boxes[:, 2] - prev_boxes[:, 0]) * (prev_boxes[:, 3] - prev_boxes[:, 1])
+        tiny_ratio = float(np.mean(areas < 32 * 32))
+    else:
+        tiny_ratio = 0.0
+    raw = 0.30 * crowd + 0.20 * min(edge_density / 0.14, 1.0) + 0.30 * tiny_ratio
+    raw += 0.10 * (brightness < 80) + 0.05 * (blur < 180)
+    analyzer.hist.append(float(np.clip(raw, 0, 1)))
+    sci = float(np.mean(analyzer.hist))
+    if brightness < 80:
+        scene = "night"
+    elif blur < 180:
+        scene = "blur"
+    elif tiny_ratio > 0.50:
+        scene = "tiny"
+    elif crowd > 0.65 or edge_density > 0.13:
+        scene = "crowded"
+    else:
+        scene = "clear"
+    return SceneState(sci, scene, brightness, blur, edge_density, crowd, tiny_ratio, n)
+
+def track_from_cache(tracker, dets, shape, params, tp):
+    arr = np.asarray(dets, dtype=float).reshape(-1, 6) if len(dets) else np.empty((0, 6), dtype=float)
+    if len(arr):
+        arr = arr[arr[:, 4] >= params["conf"]]
+    tracker.args.track_high_thresh = float(tp["high"])
+    tracker.args.track_low_thresh = float(tp["low"])
+    tracker.args.new_track_thresh = float(tp["new"])
+    tracker.args.match_thresh = float(tp["match"])
+    out = np.asarray(tracker.update(Boxes(arr, tuple(shape))), dtype=float).reshape(-1, 8)
+    if len(out):
+        ids = out[:, 4].astype(int)
+        boxes = out[:, :4]
+        scores = out[:, 5]
+    else:
+        ids = np.array([], dtype=int)
+        boxes = np.empty((0, 4))
+        scores = np.array([], dtype=float)
+    return ids, boxes, scores, arr
+
+def replay_one_trial(trial):
+    rows = []
+    pred_root = REPLAY_RUN_DIR / "predictions_mot" / trial["name"]
+    pred_root.mkdir(parents=True, exist_ok=True)
+    pbar = tqdm(total=int(local_manifest_df["frames_found"].sum()), desc=trial["name"], dynamic_ncols=True)
+    for seq_name in seqs:
+        gt = load_gt(LOCAL_ANN_DIR / f"{seq_name}.txt")
+        tracker = make_replay_tracker(trial["tracker"])
+        analyzer = SceneAnalyzer()
+        state = SceneState()
+        prev_boxes = np.empty((0, 4))
+        acc = mm.MOTAccumulator(auto_id=True)
+        pred_lines = []
+        sizes, confs, scenes = [], [], []
+        replay_times = []
+        cache_file = CACHE_DIR / f"{seq_name}.jsonl.gz"
+        if not cache_file.exists():
+            raise RuntimeError(f"Missing cache file: {cache_file}")
+        with gzip.open(cache_file, "rt", encoding="utf-8") as f:
+            for line in f:
+                start = time.perf_counter()
+                rec = json.loads(line)
+                idx = int(rec["frame"])
+                if trial["kind"] == "adaptive" and (idx == 1 or idx % 10 == 1):
+                    # Replay stays causal: SCI uses cached visual metrics and previous tracked boxes.
+                    state = analyze_cached_visual(analyzer, rec.get("visual", {}), prev_boxes)
+                params = replay_params(trial, state)
+                ids, boxes_, scores, det_arr = track_from_cache(tracker, rec["bank"][str(params["imgsz"])], rec["shape"], params, trial["tracker"])
+                prev_boxes = boxes_.copy()
+                for tid, box, score in zip(ids, boxes_, scores):
+                    x1, y1, x2, y2 = box.tolist()
+                    pred_lines.append(f"{idx},{int(tid)},{x1:.2f},{y1:.2f},{x2-x1:.2f},{y2-y1:.2f},{float(score):.6f},-1,-1,-1\n")
+                gt_f = gt[gt["frame"] == idx]
+                gt_ids = gt_f["id"].values
+                gt_boxes = np.column_stack([gt_f["x"], gt_f["y"], gt_f["x"] + gt_f["w"], gt_f["y"] + gt_f["h"]]) if len(gt_f) else np.empty((0, 4))
+                dist = iou_distance(boxes_, gt_boxes)
+                acc.update(gt_ids, ids, dist if dist.size else np.empty((len(gt_ids), len(ids))))
+                sizes.append(params["imgsz"])
+                confs.append(params["conf"])
+                scenes.append(state.scene)
+                replay_times.append(time.perf_counter() - start)
+                pbar.update(1)
+        (pred_root / f"{seq_name}.txt").write_text("".join(pred_lines), encoding="utf-8")
+        metrics = eval_motmetrics(acc, seq_name)
+        rows.append({
+            "run_tag": RUN_TAG,
+            "trial": trial["name"],
+            "sequence": seq_name,
+            "frames": len(sizes),
+            "replay_fps_not_live": len(sizes) / max(sum(replay_times), 1e-9),
+            "mean_imgsz": float(np.mean(sizes)) if sizes else 0,
+            "mean_conf": float(np.mean(confs)) if confs else 0,
+            "dominant_scene": Counter(scenes).most_common(1)[0][0] if scenes else "unknown",
+            **metrics,
+        })
+    pbar.close()
+    pd.DataFrame(rows).to_csv(REPLAY_RUN_DIR / f"{trial['name']}_per_sequence_replay.csv", index=False)
+    return pd.DataFrame(rows)
+
+replay_rows = []
+for trial in REPLAY_TRIALS:
+    replay_rows.append(replay_one_trial(trial))
+
+replay_df = pd.concat(replay_rows, ignore_index=True)
+replay_df.to_csv(REPLAY_RUN_DIR / "replay_per_sequence_motmetrics.csv", index=False)
+
+replay_summary_rows = []
+for trial, g in replay_df.groupby("trial", sort=False):
+    replay_summary_rows.append({
+        "trial": trial,
+        "sequences": len(g),
+        "mota": g["mota"].mean(),
+        "idf1": g["idf1"].mean(),
+        "recall": g["recall"].mean(),
+        "precision": g["precision"].mean(),
+        "ids": int(g["ids"].sum()),
+        "fn": int(g["fn"].sum()),
+        "fp": int(g["fp"].sum()),
+        "matches": int(g["matches"].sum()),
+        "mean_imgsz": g["mean_imgsz"].mean(),
+        "hota_approx_only_until_trackeval": g["hota_approx_only_until_trackeval"].mean(),
+    })
+replay_summary = pd.DataFrame(replay_summary_rows)
+base = replay_summary.iloc[0]
+for col in ["mota", "idf1", "recall", "precision", "hota_approx_only_until_trackeval"]:
+    replay_summary[col + "_delta_vs_default"] = replay_summary[col] - float(base[col])
+replay_summary["ids_delta_vs_default"] = replay_summary["ids"] - int(base["ids"])
+replay_summary.to_csv(REPLAY_RUN_DIR / "replay_summary_motmetrics.csv", index=False)
+(REPLAY_RUN_DIR / "replay_trials.json").write_text(json.dumps(REPLAY_TRIALS, indent=2), encoding="utf-8")
+
+print("FAST REPLAY SUMMARY — use this to choose candidate; do not quote replay FPS as real-time deployment FPS.")
+display(replay_summary)
+print("Replay saved:", REPLAY_RUN_DIR)
+"""))
+
+cells.append(cell(r"""# CELL 6 — REAL LIVE FULL-17 RUN FOR FINAL CANDIDATE
+# Run this after Cell 5 tells us which candidate is worth final validation.
+# Default final systems remain the three clean v10/presentation systems.
+# If a replay trial wins, set FINAL_TRIAL_NAMES to include it, e.g.:
+# FINAL_TRIAL_NAMES = ["Baseline_Default", "Baseline_TunedTracker", "ACMOT_V10STYLE_SCI_IDS_GUARD"]
+FINAL_TRIAL_NAMES = ["Baseline_Default", "Baseline_TunedTracker", "ACMOT_V10STYLE_SCI"]
+
+def trial_to_live_system(trial):
+    if trial["name"] == "Baseline_Default":
+        tracker_path = TRACKER_DEFAULT
+    else:
+        tp = trial["tracker"]
+        tracker_path = build_tracker_yaml(
+            WORK / f"{trial['name']}_live_tracker.yaml",
+            high=tp["high"], low=tp["low"], new=tp["new"],
+            buffer=tp["buffer"], match=tp["match"], fuse=tp.get("fuse", True)
+        )
+    return {
+        "name": trial["name"],
+        "tracker": tracker_path,
+        "scene": trial["kind"] == "adaptive",
+        "adapt_thresh": trial["kind"] == "adaptive",
+        "adapt_res": trial["kind"] == "adaptive",
+        "live_trial": trial,
+    }
+
+if "REPLAY_TRIALS" in globals():
+    trial_map = {t["name"]: t for t in REPLAY_TRIALS}
+    FINAL_SYSTEMS = [trial_to_live_system(trial_map[name]) for name in FINAL_TRIAL_NAMES]
+else:
+    FINAL_SYSTEMS = SYSTEMS
+
+print("Final live systems:")
+for s in FINAL_SYSTEMS:
+    print(" -", s["name"])
+
 require_t4()
 
 def reset_yolo_tracker(model):
@@ -401,6 +793,7 @@ def run_one_system(system):
         model.model.float()
     analyzer = SceneAnalyzer()
     calibrator = V10StyleCalibrator(system["adapt_thresh"], system["adapt_res"])
+    live_trial = system.get("live_trial")
     rows = []
     pred_root = RUN_DIR / "predictions_mot" / system["name"]
     pred_root.mkdir(parents=True, exist_ok=True)
@@ -426,7 +819,7 @@ def run_one_system(system):
                 raise RuntimeError(f"Unreadable image: {fp}")
             if system["scene"] and (idx == 1 or idx % 10 == 1):
                 state = analyzer.analyze(img, prev_boxes)
-            params = calibrator.params(state)
+            params = replay_params(live_trial, state) if live_trial else calibrator.params(state)
             res = model.track(
                 source=img,
                 tracker=system["tracker"],
@@ -492,7 +885,7 @@ def run_one_system(system):
     return pd.DataFrame(rows)
 
 all_rows = []
-for system in SYSTEMS:
+for system in FINAL_SYSTEMS:
     df = run_one_system(system)
     all_rows.append(df)
 
@@ -529,7 +922,7 @@ display(summary)
 print("Saved:", RUN_DIR)
 """))
 
-cells.append(cell(r"""# CELL 5 — OFFICIAL TRACKEVAL HOTA/CLEAR/IDENTITY
+cells.append(cell(r"""# CELL 7 — OFFICIAL TRACKEVAL HOTA/CLEAR/IDENTITY
 # This cell exports a MOTChallenge-style folder and runs official TrackEval.
 # If TrackEval API changes, the previous cell's CSVs remain valid for MOTA/IDF1/IDS,
 # but HOTA should only be quoted from this cell's TrackEval output.
@@ -562,7 +955,7 @@ def make_trackeval_layout():
             f"[Sequence]\nname={seq_name}\nimDir=img1\nframeRate=30\nseqLength={int(manifest_df[manifest_df.sequence==seq_name].frames_found.iloc[0])}\nimWidth=0\nimHeight=0\nimExt=.jpg\n",
             encoding="utf-8"
         )
-    for system in [s["name"] for s in SYSTEMS]:
+    for system in [s["name"] for s in FINAL_SYSTEMS]:
         data_dir = tr_root / system / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
         for seq_name in seqs:
@@ -581,7 +974,7 @@ cmd = [
     "--BENCHMARK", "VisDroneACMOT",
     "--SPLIT_TO_EVAL", "test",
     "--SEQMAP_FILE", str(seqmap),
-    "--TRACKERS_TO_EVAL", *[s["name"] for s in SYSTEMS],
+    "--TRACKERS_TO_EVAL", *[s["name"] for s in FINAL_SYSTEMS],
     "--METRICS", "HOTA", "CLEAR", "Identity",
     "--DO_PREPROC", "False",
     "--USE_PARALLEL", "False",
@@ -601,7 +994,7 @@ if proc.returncode != 0:
 print("Official TrackEval finished. Use TrackEval output files under:", trackers_parent)
 """))
 
-cells.append(cell(r"""# CELL 6 — REPRODUCIBILITY PACK
+cells.append(cell(r"""# CELL 8 — REPRODUCIBILITY PACK
 config = {
     "run_tag": RUN_TAG,
     "experiment_version": EXPERIMENT_VERSION,
