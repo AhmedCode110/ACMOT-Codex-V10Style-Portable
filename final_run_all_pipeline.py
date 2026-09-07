@@ -533,7 +533,7 @@ def main():
     sweep = locate_or_download_sweep()
     dataset, seqs = stage_dataset()
 
-    root = Path("/content/drive/MyDrive/ACMOT_LIVE_FINAL") / (
+    root = Path("/content/drive/MyDrive/VisDrone_Results/ACMOT_LIVE_FINAL") / (
         "priority_realtime_" + datetime.now().strftime("%Y%m%d_%H%M%S")
     )
     root.mkdir(parents=True, exist_ok=False)
