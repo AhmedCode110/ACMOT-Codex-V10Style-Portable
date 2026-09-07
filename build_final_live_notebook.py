@@ -136,13 +136,25 @@ print("Trial config:", TRIAL_CONFIG)
 cells.append(cell(r'''# CELL 4 - Verify dataset, GT, and Tesla T4
 import torch
 
-DATASET = Path("/content/drive/MyDrive/visdrone/VisDrone_Zips/VisDrone2019-MOT-test-dev/VisDrone2019-MOT-test-dev")
-SEQ_DIR = DATASET / "sequences"
-ANN_DIR = DATASET / "annotations"
+DRIVE_DATASET = Path("/content/drive/MyDrive/visdrone/VisDrone_Zips/VisDrone2019-MOT-test-dev/VisDrone2019-MOT-test-dev")
+LOCAL_DATASET = Path("/content/VisDrone2019-MOT-test-dev")
 OUTPUT_ROOT = Path("/content/drive/MyDrive/VisDrone_Results/ACMOT_LIVE_FINAL")
 
-if not SEQ_DIR.is_dir() or not ANN_DIR.is_dir():
-    raise RuntimeError(f"Dataset folders missing: {DATASET}")
+if not (DRIVE_DATASET / "sequences").is_dir() or not (DRIVE_DATASET / "annotations").is_dir():
+    raise RuntimeError(f"Drive dataset folders missing: {DRIVE_DATASET}")
+
+# Copy once before timing. This keeps Drive I/O out of the measured live FPS.
+if not (LOCAL_DATASET / "sequences").is_dir() or not (LOCAL_DATASET / "annotations").is_dir():
+    if LOCAL_DATASET.exists():
+        shutil.rmtree(LOCAL_DATASET)
+    print("Copying dataset from Drive to local Colab SSD. This is outside live timing...")
+    shutil.copytree(DRIVE_DATASET, LOCAL_DATASET)
+else:
+    print("Local dataset already staged:", LOCAL_DATASET)
+
+DATASET = LOCAL_DATASET
+SEQ_DIR = DATASET / "sequences"
+ANN_DIR = DATASET / "annotations"
 
 SEQS = sorted([p.name for p in SEQ_DIR.iterdir() if p.is_dir()])
 ANNS = sorted([p.stem for p in ANN_DIR.glob("*.txt")])
@@ -153,7 +165,8 @@ total_frames = sum(frame_counts.values())
 gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NO CUDA"
 t4_ok = torch.cuda.is_available() and "T4" in gpu_name
 
-print("Dataset:", DATASET)
+print("Drive dataset:", DRIVE_DATASET)
+print("Timed local dataset:", DATASET)
 print("Total sequences:", len(SEQS))
 print("Total annotations:", len(ANNS))
 print("Missing annotations:", missing_ann or "None")
@@ -331,13 +344,16 @@ PRED_DIR.mkdir(parents=True, exist_ok=True)
     "commit": COMMIT,
     "sweep_dir": str(SWEEP_DIR),
     "finalist_trial": FINALIST_TRIAL_NAME,
-    "dataset": str(DATASET),
+    "drive_dataset": str(DRIVE_DATASET),
+    "timed_local_dataset": str(DATASET),
     "gpu": torch.cuda.get_device_name(0),
-    "protocol": "end-to-end live timing includes image loading, SceneAnalyzer, controller, YOLOv8n FP32, and ByteTrack",
+    "protocol": "end-to-end live timing includes local SSD image loading, SceneAnalyzer, controller, YOLOv8n FP16, CUDA synchronization, and ByteTrack",
     "one_yolo_inference_per_frame": True,
+    "precision_requested": "FP16",
 }, indent=2), encoding="utf-8")
 
 model = YOLO("yolov8n.pt")
+ACTUAL_MODEL_FP16 = None
 rows = []
 total = sum(frame_counts.values())
 global_start = time.perf_counter()
@@ -374,11 +390,16 @@ with tqdm(total=total, desc=FINALIST_TRIAL_NAME, dynamic_ncols=True) as pbar:
                 imgsz=int(params["imgsz"]),
                 classes=COCO_CLASSES,
                 max_det=1000,
-                half=False,
+                half=True,
                 device=0,
                 verbose=False,
             )[0]
             sync_cuda()
+            if ACTUAL_MODEL_FP16 is None:
+                ACTUAL_MODEL_FP16 = bool(getattr(getattr(model, "predictor", None).model, "fp16", False))
+                print("actual_model_fp16:", ACTUAL_MODEL_FP16)
+                if not ACTUAL_MODEL_FP16:
+                    raise RuntimeError("FP16 was requested but Ultralytics did not report an FP16 model. Stop before publishing FPS.")
             dets = result.boxes.data.detach().cpu().numpy()
             if dets.size:
                 dets = dets.reshape(-1, dets.shape[-1]).astype(float)
@@ -443,7 +464,8 @@ summary = {
     "IDS": int(per_seq["IDS"].sum()),
     "hota_approx_only_until_trackeval": float(np.average(per_seq["hota_approx_only_until_trackeval"], weights=per_seq["frames"])),
     "mean_imgsz": float(np.average(per_seq["mean_imgsz"], weights=per_seq["frames"])),
-    "precision": "YOLOv8n FP32",
+    "precision": "YOLOv8n FP16",
+    "actual_model_fp16": bool(ACTUAL_MODEL_FP16),
     "hardware": torch.cuda.get_device_name(0),
     "status": "LIVE_COMPLETE",
 }
@@ -480,9 +502,11 @@ Run folder: `{RUN_DIR}`
 - Trial: `{FINALIST_TRIAL_NAME}`
 - Source sweep: `{SWEEP_DIR}`
 - Repo commit: `{COMMIT}`
-- Dataset: `{DATASET}`
+- Drive dataset source: `{DRIVE_DATASET}`
+- Timed local dataset: `{DATASET}`
 - Hardware: `{summary['hardware']}`
 - Precision: `{summary['precision']}`
+- Actual model FP16 reported: `{summary.get('actual_model_fp16')}`
 
 ## Live result
 
@@ -495,11 +519,11 @@ Run folder: `{RUN_DIR}`
 
 ## Timing protocol
 
-End-to-end timing includes image loading, SceneAnalyzer, controller, exactly one YOLOv8n inference per frame, CUDA synchronization, and ByteTrack.
+End-to-end timing includes image loading from local Colab SSD, SceneAnalyzer, controller, exactly one YOLOv8n FP16 inference per frame, CUDA synchronization, and ByteTrack. Dataset copy from Drive is outside timing.
 
 ## Safety note
 
-This notebook runs expensive YOLO only when `ALLOW_LIVE_RUN=True`.
+This notebook runs expensive YOLO only when `ALLOW_LIVE_RUN=True`. It stages the dataset to `/content` first and stops if FP16 is not actually reported.
 """
 (RUN_DIR / "FINAL_LIVE_REPORT.md").write_text(report, encoding="utf-8")
 print(report)
