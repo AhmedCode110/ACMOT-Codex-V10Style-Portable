@@ -2,7 +2,7 @@
 
 This is a separate Codex-owned experiment folder. It does not replace the existing AC-MOT / ChatGPT project.
 
-Current version: `v10_p2`
+Current version: `v10_p3`
 
 Purpose:
 
@@ -15,6 +15,7 @@ Purpose:
 - Keep ReID and heavier controller ideas out of the production system.
 - Use real live timing on Google Colab T4.
 - Stage the dataset from Google Drive to `/content` before timing, so FPS is not dominated by slow Drive reads.
+- Cache YOLO detections once at `640/736/832`, then replay/tune tracker and SCI settings quickly without rerunning YOLO.
 - Export MOT-format predictions and run official TrackEval for HOTA/CLEAR/Identity where TrackEval is available.
 
 Important notes:
@@ -23,7 +24,7 @@ Important notes:
 - Final benchmark mode requires a complete 17-sequence VisDrone test-dev dataset.
 - If frames or GT are missing, the notebook stops before the expensive run.
 - It saves every run configuration, sequence manifest, timing file, prediction files, and final tables to Google Drive.
-- v10_p2 keeps the v10/presentation logic; it changes the timing protocol, not the tracking idea.
+- v10_p3 keeps the v10/presentation logic; it adds a development cache/replay workflow, not a new production tracking idea.
 
 Main Colab notebook:
 
@@ -47,7 +48,10 @@ How to run on any Colab account:
 3. Make sure the Google Drive account has the VisDrone dataset at the default path, or edit `DATASET` in Cell 1.
 4. Run cells from top to bottom.
 5. Cell 2 checks Drive, then copies the verified dataset to `/content`.
-6. If Cell 2 reports missing frames or GT, fix the dataset before running the live benchmark.
+6. Cell 4 builds or resumes the YOLO detection cache once.
+7. Cell 5 replays/tunes quickly without YOLO.
+8. Cell 6 runs the final live benchmark only for the selected candidate.
+9. If Cell 2 reports missing frames or GT, fix the dataset before running the live benchmark.
 
 Version rule:
 
